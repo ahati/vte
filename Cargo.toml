@@ -1,6 +1,6 @@
 [package]
 authors = ["Joe Wilm <joe@jwilm.com>", "Christian Duerr <contact@christianduerr.com>"]
-description = "Parser for implementing terminal emulators"
+description = "Parser for implementing terminal emulators, with a streaming APC (ESC _) API for the Kitty graphics protocol"
 repository = "https://github.com/alacritty/vte"
 documentation = "https://docs.rs/vte/"
 keywords = ["ansi", "vte", "parser", "terminal"]
