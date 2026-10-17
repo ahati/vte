@@ -729,6 +729,18 @@ pub trait Handler {
 
     // Set SCP control.
     fn set_scp(&mut self, _char_path: ScpCharPath, _update_mode: ScpUpdateMode) {}
+
+    /// Invoked when an APC (`ESC _`) string starts.
+    ///
+    /// Each payload byte is subsequently delivered to [`Handler::apc_put`], and
+    /// [`Handler::apc_end`] is called exactly once when the string ends.
+    fn apc_start(&mut self) {}
+
+    /// Pass a byte of an APC string started by [`Handler::apc_start`].
+    fn apc_put(&mut self, _byte: u8) {}
+
+    /// Invoked when the APC string started by [`Handler::apc_start`] ends.
+    fn apc_end(&mut self) {}
 }
 
 bitflags! {
@@ -1326,6 +1338,21 @@ where
     }
 
     #[inline]
+    fn apc_start(&mut self) {
+        self.handler.apc_start();
+    }
+
+    #[inline]
+    fn apc_put(&mut self, byte: u8) {
+        self.handler.apc_put(byte);
+    }
+
+    #[inline]
+    fn apc_end(&mut self) {
+        self.handler.apc_end();
+    }
+
+    #[inline]
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
@@ -1338,7 +1365,7 @@ where
                 }
                 buf.push_str("],");
             }
-            debug!("[unhandled osc_dispatch]: [{}] at line {}", &buf, line!());
+            debug!("[unhandled osc_dispatch]: [{}] at line {}", buf, line!());
         }
 
         if params.is_empty() || params[0].is_empty() {

@@ -30,6 +30,18 @@ impl Perform for Log {
         println!("[unhook]");
     }
 
+    fn apc_start(&mut self) {
+        println!("[apc_start]");
+    }
+
+    fn apc_put(&mut self, byte: u8) {
+        println!("[apc_put] {:02x}", byte);
+    }
+
+    fn apc_end(&mut self) {
+        println!("[apc_end]");
+    }
+
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         println!("[osc_dispatch] params={:?} bell_terminated={}", params, bell_terminated);
     }

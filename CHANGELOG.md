@@ -3,6 +3,9 @@ CHANGELOG
 
 ## 0.15.0
 
+- Add streaming APC (`ESC _`) callbacks `Perform::apc_start`, `Perform::apc_put`, and
+    `Perform::apc_end` (forwarded by `ansi::Handler`) so APC payloads, such as the Kitty
+    graphics protocol, are no longer discarded
 - Support `CSI ? 5 W` to reset tabs stops to every 8th column
 - Replaced `no_std` with a new `std` feature
 - Changed default features to include `std`

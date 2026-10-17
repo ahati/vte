@@ -23,6 +23,20 @@
 //! * OSC Strings can be terminated by 0x07
 //! * Only supports 7-bit codes
 //!
+//! # String Handling
+//!
+//! [`Perform::hook`]/[`Perform::put`]/[`Perform::unhook`] deliver the payload
+//! of a Device Control String (`ESC P`), while Operating System Commands
+//! (`ESC ]`) are buffered and dispatched as a whole through
+//! [`Perform::osc_dispatch`].
+//!
+//! Application Program Commands (`ESC _`, APC) use a streaming API instead:
+//! [`Perform::apc_start`] is called when the string begins, every payload byte
+//! is streamed through [`Perform::apc_put`], and [`Perform::apc_end`] is
+//! invoked exactly once when the string terminates or is aborted. This keeps
+//! parser memory constant even for arbitrarily large payloads, which is
+//! required by protocols like the Kitty graphics protocol.
+//!
 //! [`Parser`]: struct.Parser.html
 //! [`Perform`]: trait.Perform.html
 //! [Paul Williams' ANSI parser state machine]: https://vt100.net/emu/dec_ansi_parser
@@ -181,8 +195,34 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::Escape => self.advance_esc(performer, byte),
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => self.advance_osc_string(performer, byte),
+            State::ApcString => self.advance_apc(performer, byte),
             State::SosPmApcString => self.anywhere(performer, byte),
             State::Ground => unreachable!(),
+        }
+    }
+
+    #[inline(always)]
+    fn advance_apc<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            // CAN/SUB abort the string, then execute as usual.
+            0x18 | 0x1A => {
+                performer.apc_end();
+                performer.execute(byte);
+                self.state = State::Ground;
+            },
+            // ESC ends the string; the following byte is parsed as a new escape
+            // sequence, so `ESC \` still reaches `esc_dispatch`.
+            0x1B => {
+                performer.apc_end();
+                self.reset_params();
+                self.state = State::Escape;
+            },
+            // C1 String Terminator.
+            0x9C => {
+                performer.apc_end();
+                self.state = State::Ground;
+            },
+            _ => performer.apc_put(byte),
         }
     }
 
@@ -376,7 +416,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.osc_num_params = 0;
                 self.state = State::OscString
             },
-            0x5E..=0x5F => self.state = State::SosPmApcString,
+            0x5E => self.state = State::SosPmApcString,
+            0x5F => {
+                performer.apc_start();
+                self.state = State::ApcString
+            },
             0x60..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
@@ -745,6 +789,7 @@ enum State {
     Escape,
     EscapeIntermediate,
     OscString,
+    ApcString,
     SosPmApcString,
     #[default]
     Ground,
@@ -789,6 +834,24 @@ pub trait Perform {
     /// The previously selected handler should be notified that the DCS has
     /// terminated.
     fn unhook(&mut self) {}
+
+    /// Invoked when an APC (Application Program Command, `ESC _`) string starts.
+    ///
+    /// This is called before any payload bytes are delivered. Each payload byte
+    /// (which for Kitty graphics includes the leading `G`) is passed to
+    /// [`Perform::apc_put`], and [`Perform::apc_end`] is called exactly once when
+    /// the string terminates or is aborted.
+    fn apc_start(&mut self) {}
+
+    /// Pass a byte of an APC string started by [`Perform::apc_start`].
+    fn apc_put(&mut self, _byte: u8) {}
+
+    /// Invoked when the APC string started by [`Perform::apc_start`] ends.
+    ///
+    /// Called exactly once per `apc_start`, including when the string is aborted
+    /// by CAN/SUB. Note that the terminating `ESC \` is still dispatched to
+    /// [`Perform::esc_dispatch`] afterwards, preserving existing behaviour.
+    fn apc_end(&mut self) {}
 
     /// Dispatch an operating system command.
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
@@ -859,6 +922,9 @@ mod tests {
         Print(char),
         Execute(u8),
         DcsUnhook,
+        ApcStart,
+        ApcPut(u8),
+        ApcEnd,
     }
 
     impl Perform for Dispatcher {
@@ -890,6 +956,18 @@ mod tests {
 
         fn unhook(&mut self) {
             self.dispatched.push(Sequence::DcsUnhook);
+        }
+
+        fn apc_start(&mut self) {
+            self.dispatched.push(Sequence::ApcStart);
+        }
+
+        fn apc_put(&mut self, byte: u8) {
+            self.dispatched.push(Sequence::ApcPut(byte));
+        }
+
+        fn apc_end(&mut self) {
+            self.dispatched.push(Sequence::ApcEnd);
         }
 
         fn print(&mut self, c: char) {
@@ -1540,5 +1618,197 @@ mod tests {
         assert_eq!(dispatcher.dispatched.len(), 2);
         assert_eq!(dispatcher.dispatched[0], Sequence::Execute(0x18));
         assert_eq!(dispatcher.dispatched[1], Sequence::Execute(0x1A));
+    }
+
+    /// A single APC callback, in delivery order.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ApcEvent {
+        Start,
+        Put(u8),
+        End,
+    }
+
+    /// Collect all APC callbacks from the dispatcher, preserving their order.
+    fn apc_events(dispatched: &[Sequence]) -> Vec<ApcEvent> {
+        dispatched
+            .iter()
+            .filter_map(|sequence| match sequence {
+                Sequence::ApcStart => Some(ApcEvent::Start),
+                Sequence::ApcPut(byte) => Some(ApcEvent::Put(*byte)),
+                Sequence::ApcEnd => Some(ApcEvent::End),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The exact sequence of APC callbacks expected for a payload.
+    ///
+    /// This asserts balanced `start`/`end` with every payload byte in between.
+    fn expected_apc_events(payload: &[u8]) -> Vec<ApcEvent> {
+        let mut events = vec![ApcEvent::Start];
+        events.extend(payload.iter().copied().map(ApcEvent::Put));
+        events.push(ApcEvent::End);
+        events
+    }
+
+    /// Build a full APC escape sequence around a payload.
+    fn apc_input(payload: &[u8]) -> Vec<u8> {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b_");
+        input.extend_from_slice(payload);
+        input.extend_from_slice(b"\x1b\\");
+        input
+    }
+
+    #[test]
+    fn parse_apc() {
+        const PAYLOAD: &[u8] = b"GTEST";
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, &apc_input(PAYLOAD));
+
+        // The leading `G` must be delivered as part of the payload.
+        assert_eq!(apc_events(&dispatcher.dispatched), expected_apc_events(PAYLOAD));
+
+        // The terminating `ESC \` is still dispatched to `esc_dispatch`.
+        assert_eq!(dispatcher.dispatched.last(), Some(&Sequence::Esc(Vec::new(), false, b'\\')));
+        assert_eq!(dispatcher.dispatched.len(), PAYLOAD.len() + 3);
+    }
+
+    #[test]
+    fn parse_empty_apc() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, b"\x1b_\x1b\\");
+
+        assert_eq!(apc_events(&dispatcher.dispatched), vec![ApcEvent::Start, ApcEvent::End]);
+    }
+
+    #[test]
+    fn parse_apc_split_at_every_boundary() {
+        const PAYLOAD: &[u8] = b"Gf=24,s=10,v=20;AAAB";
+        let input = apc_input(PAYLOAD);
+
+        for split in 0..=input.len() {
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+
+            parser.advance(&mut dispatcher, &input[..split]);
+            parser.advance(&mut dispatcher, &input[split..]);
+
+            assert_eq!(
+                apc_events(&dispatcher.dispatched),
+                expected_apc_events(PAYLOAD),
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_apc_byte_by_byte() {
+        const PAYLOAD: &[u8] = b"Gf=24,s=10,v=20;AAAB";
+        let input = apc_input(PAYLOAD);
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        for byte in input {
+            parser.advance(&mut dispatcher, &[byte]);
+        }
+
+        assert_eq!(apc_events(&dispatcher.dispatched), expected_apc_events(PAYLOAD));
+    }
+
+    #[test]
+    fn apc_aborted_by_can_and_sub() {
+        const PAYLOAD: &[u8] = b"GAB";
+
+        for terminator in [0x18u8, 0x1A] {
+            let mut input = Vec::new();
+            input.extend_from_slice(b"\x1b_");
+            input.extend_from_slice(PAYLOAD);
+            input.push(terminator);
+
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+
+            parser.advance(&mut dispatcher, &input);
+
+            // The payload is delivered, then the string ends before the control fires.
+            assert_eq!(apc_events(&dispatcher.dispatched), expected_apc_events(PAYLOAD));
+            assert_eq!(
+                dispatcher.dispatched.last(),
+                Some(&Sequence::Execute(terminator)),
+                "terminator {terminator:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn apc_terminated_by_c1_st() {
+        const PAYLOAD: &[u8] = b"GTEST";
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, b"\x1b_GTEST\x9c");
+
+        assert_eq!(apc_events(&dispatcher.dispatched), expected_apc_events(PAYLOAD));
+    }
+
+    #[test]
+    fn apc_not_triggered_by_other_strings() {
+        // SOS (`ESC X`) and PM (`ESC ^`) still discard their payload and must
+        // not invoke any APC callback.
+        for input in [&b"\x1bXhello\x1b\\"[..], &b"\x1b^hello\x1b\\"[..]] {
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+
+            parser.advance(&mut dispatcher, input);
+
+            assert!(apc_events(&dispatcher.dispatched).is_empty());
+            assert_eq!(dispatcher.dispatched, vec![Sequence::Esc(Vec::new(), false, b'\\')]);
+        }
+
+        // OSC (`ESC ]`) must keep dispatching through `osc_dispatch` only.
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, b"\x1b]2;title\x07");
+
+        assert!(apc_events(&dispatcher.dispatched).is_empty());
+        assert_eq!(dispatcher.dispatched.len(), 1);
+        match &dispatcher.dispatched[0] {
+            Sequence::Osc(_, true) => (),
+            other => panic!("expected osc sequence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apc_followed_by_text() {
+        const PAYLOAD: &[u8] = b"GTEST";
+
+        let mut input = apc_input(PAYLOAD);
+        input.extend_from_slice(b"hello");
+
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, &input);
+
+        assert_eq!(apc_events(&dispatcher.dispatched), expected_apc_events(PAYLOAD));
+
+        let printed: Vec<char> = dispatcher
+            .dispatched
+            .iter()
+            .filter_map(|sequence| match sequence {
+                Sequence::Print(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(printed, vec!['h', 'e', 'l', 'l', 'o']);
     }
 }
