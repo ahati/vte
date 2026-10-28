@@ -682,6 +682,15 @@ pub trait Handler {
     /// Load data from clipboard.
     fn clipboard_load(&mut self, _: u8, _: &str) {}
 
+    /// Handle an OSC sequence the dispatcher does not implement.
+    ///
+    /// `params` holds the raw `;`-separated body of the sequence, with the
+    /// OSC number at `params[0]`. `bell_terminated` reports whether the
+    /// sequence ended with BEL instead of ST. Extensions that piggyback on
+    /// previously unknown OSC numbers are dispatched from here, keeping
+    /// this crate free of their syntax and semantics.
+    fn unhandled_osc(&mut self, _: &[&[u8]], _: bool) {}
+
     /// Run the decaln routine.
     fn decaln(&mut self) {}
 
@@ -1547,7 +1556,10 @@ where
             // Reset text cursor color.
             b"112" => self.handler.reset_color(NamedColor::Cursor as usize),
 
-            _ => unhandled(params),
+            _ => {
+                unhandled(params);
+                self.handler.unhandled_osc(params, bell_terminated);
+            },
         }
     }
 
